@@ -465,3 +465,127 @@ class OpenStackClient:
 
         self.ensure_default_sg_rules(logs)
         return {"network_id": net["id"], "subnet_id": subnet["id"], "router_id": router["id"]}
+
+    # ----- Yêu cầu 7: Octavia Load Balancer -----
+
+    def wait_for_lb_active(self, lb_id):
+        """Polling provisioning_status == ACTIVE (mỗi POLL_INTERVAL giây, tối đa POLL_TIMEOUT giây)."""
+        state = {"status": None}
+
+        def check():
+            lb = self._request(
+                "GET", "load-balancer", f"/v2.0/lbaas/loadbalancers/{lb_id}"
+            )["loadbalancer"]
+            state["status"] = lb["provisioning_status"]
+            if state["status"] == "ERROR":
+                raise OpenStackError(f"Load Balancer {lb_id} ở trạng thái ERROR")
+            return state["status"] == "ACTIVE", lb
+
+        return self._poll(
+            check,
+            lambda: f"Load Balancer {lb_id} đạt ACTIVE (trạng thái hiện tại: {state['status']})",
+        )
+
+    def find_lb(self):
+        lbs = self._request(
+            "GET", "load-balancer", "/v2.0/lbaas/loadbalancers", params={"name": config.LB_NAME}
+        )["loadbalancers"]
+        return self._find_by_name(lbs, config.LB_NAME)
+
+    def _require_lb(self):
+        lb = self.find_lb()
+        if not lb:
+            raise OpenStackError(
+                f"Chưa có Load Balancer '{config.LB_NAME}', hãy tạo Load Balancer trước"
+            )
+        if not lb.get("pools"):
+            raise OpenStackError(f"Load Balancer '{config.LB_NAME}' chưa có Pool")
+        return lb, lb["pools"][0]["id"]
+
+    def list_pool_members(self, pool_id):
+        return self._request(
+            "GET", "load-balancer", f"/v2.0/lbaas/pools/{pool_id}/members"
+        )["members"]
+
+    def add_pool_member(self, lb_id, pool_id, address, subnet_id, logs=None):
+        self.wait_for_lb_active(lb_id)
+        body = {"member": {"address": address, "protocol_port": 80, "subnet_id": subnet_id}}
+        member = self._request(
+            "POST", "load-balancer", f"/v2.0/lbaas/pools/{pool_id}/members", json=body
+        )["member"]
+        self.wait_for_lb_active(lb_id)
+        self._log(logs, f"Đã thêm {address}:80 vào Pool của Load Balancer")
+        return member
+
+    def remove_pool_member(self, lb_id, pool_id, member_id, logs=None):
+        self.wait_for_lb_active(lb_id)
+        self._request(
+            "DELETE", "load-balancer", f"/v2.0/lbaas/pools/{pool_id}/members/{member_id}"
+        )
+        self.wait_for_lb_active(lb_id)
+        self._log(logs, f"Đã xóa member {member_id} khỏi Pool của Load Balancer")
+
+    def create_load_balancer(self, logs=None):
+        if self.find_lb():
+            raise OpenStackError(
+                f"Load Balancer '{config.LB_NAME}' đã tồn tại, hãy dùng Scale Out/Scale In"
+            )
+        network = self._require_network()
+        subnet = self._find_by_name(
+            self.list_subnets(network_id=network["id"], name=config.SUBNET_NAME), config.SUBNET_NAME
+        )
+        if not subnet:
+            raise OpenStackError(
+                f"Chưa có subnet '{config.SUBNET_NAME}', hãy chạy Thiết lập mạng 1-Click trước"
+            )
+
+        lb = self._request(
+            "POST", "load-balancer", "/v2.0/lbaas/loadbalancers",
+            json={"loadbalancer": {"name": config.LB_NAME, "vip_subnet_id": subnet["id"]}},
+        )["loadbalancer"]
+        self._log(logs, f"Đã gửi yêu cầu tạo Load Balancer {config.LB_NAME} ({lb['id']})")
+        lb = self.wait_for_lb_active(lb["id"])
+        self._log(logs, "Load Balancer ACTIVE")
+
+        listener = self._request(
+            "POST", "load-balancer", "/v2.0/lbaas/listeners",
+            json={"listener": {
+                "name": f"{config.LB_NAME}_listener",
+                "protocol": "HTTP",
+                "protocol_port": 80,
+                "loadbalancer_id": lb["id"],
+            }},
+        )["listener"]
+        self.wait_for_lb_active(lb["id"])
+        self._log(logs, f"Đã tạo Listener HTTP:80 ({listener['id']})")
+
+        pool = self._request(
+            "POST", "load-balancer", "/v2.0/lbaas/pools",
+            json={"pool": {
+                "name": f"{config.LB_NAME}_pool",
+                "protocol": "HTTP",
+                "lb_algorithm": "ROUND_ROBIN",
+                "listener_id": listener["id"],
+            }},
+        )["pool"]
+        self.wait_for_lb_active(lb["id"])
+        self._log(logs, f"Đã tạo Pool ROUND_ROBIN ({pool['id']})")
+
+        members = []
+        for vm in self.list_nhom17_vms():
+            if vm["fixed_ips"]:
+                address = vm["fixed_ips"][0]
+                self.add_pool_member(lb["id"], pool["id"], address, subnet["id"], logs)
+                members.append(address)
+        if not members:
+            self._log(logs, "Chưa có máy ảo nhom17_vm_* nào để thêm vào Pool")
+
+        floating_ip = self._create_floating_ip(lb["vip_port_id"])
+        self._log(logs, f"Đã gán Floating IP {floating_ip} cho VIP của Load Balancer")
+        return {
+            "lb_id": lb["id"],
+            "pool_id": pool["id"],
+            "vip_address": lb["vip_address"],
+            "floating_ip": floating_ip,
+            "members": members,
+        }
