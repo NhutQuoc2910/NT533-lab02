@@ -25,6 +25,9 @@ systemctl enable nginx
 systemctl restart nginx
 """
 
+# Rule ingress cần mở trên Security Group "default": (protocol, port).
+DEFAULT_SG_RULES = (("tcp", 80), ("tcp", 22), ("icmp", None))
+
 
 class OpenStackError(Exception):
     """Lỗi từ OpenStack hoặc từ logic orchestration, mang thông báo đọc được."""
@@ -361,3 +364,104 @@ class OpenStackClient:
         address = self._create_floating_ip(ports[0]["id"])
         self._log(logs, f"Đã gán Floating IP {address} cho máy ảo {server_id}")
         return {"server_id": server_id, "floating_ip": address}
+
+    # ----- Yêu cầu 5: Thiết lập mạng 1-Click -----
+
+    @staticmethod
+    def _rule_matches(rule, protocol, port):
+        return (
+            rule.get("direction") == "ingress"
+            and rule.get("ethertype") == "IPv4"
+            and rule.get("protocol") == protocol
+            and rule.get("port_range_min") == port
+            and rule.get("port_range_max") == port
+            and rule.get("remote_ip_prefix") in (None, "0.0.0.0/0")
+            and not rule.get("remote_group_id")
+        )
+
+    def ensure_default_sg_rules(self, logs=None):
+        groups = self._request(
+            "GET", "network", "/v2.0/security-groups", params={"name": "default"}
+        )["security_groups"]
+        if not groups:
+            raise OpenStackError("Không tìm thấy Security Group 'default'")
+        sg_id = groups[0]["id"]
+        existing = self._request(
+            "GET", "network", "/v2.0/security-group-rules", params={"security_group_id": sg_id}
+        )["security_group_rules"]
+        for protocol, port in DEFAULT_SG_RULES:
+            label = f"{protocol.upper()}/{port}" if port else protocol.upper()
+            if any(self._rule_matches(r, protocol, port) for r in existing):
+                self._log(logs, f"Rule {label} trên Security Group default đã tồn tại, bỏ qua")
+                continue
+            rule = {
+                "security_group_id": sg_id,
+                "direction": "ingress",
+                "ethertype": "IPv4",
+                "protocol": protocol,
+                "remote_ip_prefix": "0.0.0.0/0",
+            }
+            if port:
+                rule["port_range_min"] = port
+                rule["port_range_max"] = port
+            try:
+                self._request(
+                    "POST", "network", "/v2.0/security-group-rules",
+                    json={"security_group_rule": rule},
+                )
+            except OpenStackError as err:
+                if err.status == 409:
+                    self._log(logs, f"Rule {label} đã tồn tại (409), bỏ qua")
+                    continue
+                raise
+            self._log(logs, f"Đã thêm rule ingress {label} vào Security Group default")
+
+    def setup_network_1click(self, logs=None):
+        net = self._find_by_name(self.list_networks(name=config.NET_NAME), config.NET_NAME)
+        if net:
+            self._log(logs, f"Network {config.NET_NAME} đã tồn tại ({net['id']})")
+        else:
+            net = self.create_network(config.NET_NAME)
+            self._log(logs, f"Đã tạo network {config.NET_NAME} ({net['id']})")
+
+        subnet = self._find_by_name(
+            self.list_subnets(network_id=net["id"], name=config.SUBNET_NAME), config.SUBNET_NAME
+        )
+        if subnet:
+            self._log(logs, f"Subnet {config.SUBNET_NAME} đã tồn tại ({subnet['id']})")
+        else:
+            subnet = self.create_subnet(
+                net["id"],
+                config.SUBNET_NAME,
+                config.CIDR,
+                gateway_ip=config.GATEWAY_IP,
+                allocation_pools=[config.ALLOCATION_POOL],
+                dns_nameservers=config.DNS_NAMESERVERS,
+            )
+            self._log(
+                logs,
+                f"Đã tạo subnet {config.SUBNET_NAME} ({config.CIDR}, "
+                f"pool từ {config.ALLOCATION_POOL['start']})",
+            )
+
+        router = self._find_by_name(self.list_routers(name=config.ROUTER_NAME), config.ROUTER_NAME)
+        if router:
+            self._log(logs, f"Router {config.ROUTER_NAME} đã tồn tại ({router['id']})")
+        else:
+            external_id = self.get_external_network_id()
+            router = self.create_router(config.ROUTER_NAME, external_network_id=external_id)
+            self._log(logs, f"Đã tạo router {config.ROUTER_NAME} nối External Network {external_id}")
+
+        attached = any(
+            ip.get("subnet_id") == subnet["id"]
+            for port in self._router_ports(router["id"])
+            for ip in port.get("fixed_ips", [])
+        )
+        if attached:
+            self._log(logs, f"Router đã gắn interface {config.SUBNET_NAME}, bỏ qua")
+        else:
+            self.add_router_interface(router["id"], subnet["id"])
+            self._log(logs, f"Đã gắn interface {config.SUBNET_NAME} vào router")
+
+        self.ensure_default_sg_rules(logs)
+        return {"network_id": net["id"], "subnet_id": subnet["id"], "router_id": router["id"]}
