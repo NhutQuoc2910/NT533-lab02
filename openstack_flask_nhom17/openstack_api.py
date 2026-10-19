@@ -589,3 +589,57 @@ class OpenStackClient:
             "floating_ip": floating_ip,
             "members": members,
         }
+
+    # ----- Yêu cầu 8: Scale Out / Scale In -----
+
+    def scale_out(self, logs=None):
+        if not config.DEFAULT_IMAGE_ID or not config.DEFAULT_FLAVOR_ID:
+            missing = [
+                name for name, value in (
+                    ("DEFAULT_IMAGE_ID", config.DEFAULT_IMAGE_ID),
+                    ("DEFAULT_FLAVOR_ID", config.DEFAULT_FLAVOR_ID),
+                ) if not value
+            ]
+            raise OpenStackError("Thiếu cấu hình trong .env: " + ", ".join(missing))
+        lb, pool_id = self._require_lb()
+        name = self.next_vm_name()
+        self._log(logs, f"Scale Out: tạo máy ảo {name} (không gán Floating IP riêng)")
+        created = self.create_vm(
+            name, config.DEFAULT_IMAGE_ID, config.DEFAULT_FLAVOR_ID, web=True, logs=logs
+        )
+        try:
+            self.add_pool_member(lb["id"], pool_id, created["ip"], lb["vip_subnet_id"], logs)
+        except OpenStackError as err:
+            self._log(logs, f"Thêm {name} vào Load Balancer thất bại, máy ảo được giữ lại để xử lý thủ công")
+            raise OpenStackError(
+                f"Máy ảo {name} đã tạo nhưng không thêm được vào Load Balancer: {err.message}",
+                err.status,
+            ) from err
+        self._log(logs, f"Scale Out hoàn tất: {name} ({created['ip']}) đã nằm trong Load Balancer")
+        return created
+
+    def scale_in(self, logs=None, server_id=None):
+        vms = self.list_nhom17_vms()
+        if len(vms) <= 1:
+            raise OpenStackError("Chỉ còn 1 VM, không thể Scale In")
+        if server_id:
+            target = next((v for v in vms if v["id"] == server_id), None)
+            if not target:
+                raise OpenStackError(f"Không tìm thấy máy ảo {server_id} trong nhóm {config.VM_PREFIX}*")
+        else:
+            target = vms[-1]
+        lb, pool_id = self._require_lb()
+        self._log(logs, f"Scale In: chọn máy ảo {target['name']}")
+
+        member = next(
+            (m for m in self.list_pool_members(pool_id) if m["address"] in target["fixed_ips"]),
+            None,
+        )
+        if member:
+            self.remove_pool_member(lb["id"], pool_id, member["id"], logs)
+        else:
+            self._log(logs, f"{target['name']} không nằm trong Pool, bỏ qua bước xóa member")
+
+        self.delete_server(target["id"])
+        self._log(logs, f"Đã xóa máy ảo {target['name']}")
+        return {"deleted": target["name"], "member_removed": member is not None}
