@@ -163,3 +163,81 @@ class OpenStackClient:
     def list_networks(self, name=None):
         params = {"name": name} if name else None
         return self._request("GET", "network", "/v2.0/networks", params=params)["networks"]
+
+    def create_network(self, name):
+        body = {"network": {"name": name, "admin_state_up": True}}
+        return self._request("POST", "network", "/v2.0/networks", json=body)["network"]
+
+    def delete_network(self, network_id):
+        for subnet in self.list_subnets(network_id=network_id):
+            self.delete_subnet(subnet["id"])
+        self._request("DELETE", "network", f"/v2.0/networks/{network_id}")
+
+    def get_external_network_id(self):
+        nets = self._request(
+            "GET", "network", "/v2.0/networks", params={"router:external": "true"}
+        )["networks"]
+        if not nets:
+            raise OpenStackError("Không tìm thấy External Network (router:external=true)")
+        return nets[0]["id"]
+
+    def list_subnets(self, network_id=None, name=None):
+        params = {}
+        if network_id:
+            params["network_id"] = network_id
+        if name:
+            params["name"] = name
+        return self._request("GET", "network", "/v2.0/subnets", params=params or None)["subnets"]
+
+    def create_subnet(self, network_id, name, cidr, gateway_ip=None,
+                      allocation_pools=None, dns_nameservers=None, enable_dhcp=True):
+        subnet = {
+            "network_id": network_id,
+            "name": name,
+            "ip_version": 4,
+            "cidr": cidr,
+            "enable_dhcp": enable_dhcp,
+        }
+        if gateway_ip:
+            subnet["gateway_ip"] = gateway_ip
+        if allocation_pools:
+            subnet["allocation_pools"] = allocation_pools
+        if dns_nameservers:
+            subnet["dns_nameservers"] = dns_nameservers
+        return self._request("POST", "network", "/v2.0/subnets", json={"subnet": subnet})["subnet"]
+
+    def delete_subnet(self, subnet_id):
+        self._request("DELETE", "network", f"/v2.0/subnets/{subnet_id}")
+
+    def list_routers(self, name=None):
+        params = {"name": name} if name else None
+        return self._request("GET", "network", "/v2.0/routers", params=params)["routers"]
+
+    def create_router(self, name, external_network_id=None):
+        router = {"name": name, "admin_state_up": True}
+        if external_network_id:
+            router["external_gateway_info"] = {"network_id": external_network_id}
+        return self._request("POST", "network", "/v2.0/routers", json={"router": router})["router"]
+
+    def add_router_interface(self, router_id, subnet_id):
+        return self._request(
+            "PUT", "network", f"/v2.0/routers/{router_id}/add_router_interface",
+            json={"subnet_id": subnet_id},
+        )
+
+    def remove_router_interface(self, router_id, subnet_id=None, port_id=None):
+        body = {"subnet_id": subnet_id} if subnet_id else {"port_id": port_id}
+        return self._request(
+            "PUT", "network", f"/v2.0/routers/{router_id}/remove_router_interface", json=body
+        )
+
+    def _router_ports(self, router_id):
+        return self._request(
+            "GET", "network", "/v2.0/ports",
+            params={"device_id": router_id, "device_owner": "network:router_interface"},
+        )["ports"]
+
+    def delete_router(self, router_id):
+        for port in self._router_ports(router_id):
+            self.remove_router_interface(router_id, port_id=port["id"])
+        self._request("DELETE", "network", f"/v2.0/routers/{router_id}")
