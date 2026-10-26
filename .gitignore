@@ -1,0 +1,16 @@
+# Python & Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Environment secrets
+.env
+*.env
+
+# AI & IDE configs
+.agents/
+skills/
+.vscode/
+.idea/

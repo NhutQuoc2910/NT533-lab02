@@ -7,25 +7,35 @@ import re
 import time
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 import config
 
 SERVICE_TYPES = ("compute", "network", "image", "load-balancer")
 
 WEB_USER_DATA_SCRIPT = """#!/bin/bash
-apt-get update -y
-apt-get install -y nginx
 IP=$(hostname -I | xargs)
+mkdir -p /var/www/html
 cat > /var/www/html/index.html <<EOF
 <!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Nhóm 17 - NT533</title></head>
+<html><head><meta charset="utf-8"><title>Nhóm 17 - NT533.R11</title></head>
 <body><h1>Nhóm 17 - NT533</h1><p>Địa chỉ IP nội bộ: ${IP}</p></body></html>
 EOF
-systemctl enable nginx
-systemctl restart nginx
+
+# Chạy web server ngay lập tức bằng python3 có sẵn trong Ubuntu Cloud Image
+nohup python3 -m http.server 80 --directory /var/www/html > /var/log/web_server.log 2>&1 &
+
+# Cài đặt Nginx nếu có kết nối Internet và nâng cấp dịch vụ
+apt-get update -y
+apt-get install -y nginx
+if command -v nginx > /dev/null 2>&1; then
+    pkill -f "python3 -m http.server 80" || true
+    systemctl enable nginx
+    systemctl restart nginx
+fi
 """
 
-# Rule ingress cần mở trên Security Group "default": (protocol, port).
 DEFAULT_SG_RULES = (("tcp", 80), ("tcp", 22), ("icmp", None))
 
 
@@ -36,6 +46,7 @@ class OpenStackError(Exception):
         super().__init__(message)
         self.message = message
         self.status = status
+        self.status_code = status
 
 
 def normalize_base_url(url):
@@ -75,11 +86,22 @@ def _error_text(resp):
 
 class OpenStackClient:
     def __init__(self, session=None):
-        self.session = session or requests.Session()
+        if session is not None:
+            self.session = session
+        else:
+            self.session = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[500, 502, 503, 504],
+                raise_on_status=False,
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=20, pool_maxsize=20)
+            self.session.mount("https://", adapter)
+            self.session.mount("http://", adapter)
         self.token = None
         self.endpoints = {}
 
-    # ----- Xác thực và gọi HTTP -----
 
     def authenticate(self):
         body = {
@@ -93,12 +115,25 @@ class OpenStackClient:
                 }
             }
         }
-        resp = self.session.post(
-            config.OS_AUTH_URL,
-            json=body,
-            timeout=config.HTTP_TIMEOUT,
-            verify=config.VERIFY_SSL,
-        )
+        resp = None
+        for attempt in (1, 2, 3):
+            try:
+                resp = self.session.post(
+                    config.OS_AUTH_URL,
+                    json=body,
+                    timeout=config.HTTP_TIMEOUT,
+                    verify=config.VERIFY_SSL,
+                )
+                break
+            except requests.exceptions.RequestException as exc:
+                if attempt < 3:
+                    time.sleep(1)
+                    continue
+                raise OpenStackError(
+                    f"Lỗi kết nối tới Keystone ({config.OS_AUTH_URL}): {exc}. "
+                    "Hạ tầng NC-Cloud UIT chập chờn, vui lòng thử lại sau vài giây."
+                ) from exc
+
         if resp.status_code not in (200, 201):
             raise OpenStackError(_error_text(resp), resp.status_code)
         self.token = resp.headers["X-Subject-Token"]
@@ -127,15 +162,25 @@ class OpenStackClient:
             self.authenticate()
         resp = None
         for attempt in (1, 2):
-            resp = self.session.request(
-                method,
-                self._base(service) + path,
-                headers={"X-Auth-Token": self.token, "Content-Type": "application/json"},
-                params=params,
-                json=json,
-                timeout=config.HTTP_TIMEOUT,
-                verify=config.VERIFY_SSL,
-            )
+            try:
+                resp = self.session.request(
+                    method,
+                    self._base(service) + path,
+                    headers={"X-Auth-Token": self.token, "Content-Type": "application/json"},
+                    params=params,
+                    json=json,
+                    timeout=config.HTTP_TIMEOUT,
+                    verify=config.VERIFY_SSL,
+                )
+            except requests.exceptions.RequestException as exc:
+                if attempt == 1:
+                    time.sleep(1)
+                    continue
+                raise OpenStackError(
+                    f"Lỗi kết nối tới dịch vụ '{service}' ({exc}). "
+                    "Hạ tầng NC-Cloud UIT chập chờn hoặc đóng kết nối, vui lòng thử lại."
+                ) from exc
+
             if resp.status_code == 401 and attempt == 1:
                 self.authenticate()
                 continue
@@ -146,7 +191,6 @@ class OpenStackClient:
             return {}
         return resp.json()
 
-    # ----- Tiện ích dùng chung -----
 
     @staticmethod
     def _log(logs, message):
@@ -168,7 +212,6 @@ class OpenStackClient:
                 raise OpenStackError(f"Quá thời gian chờ {what()} (>{config.POLL_TIMEOUT}s)")
             time.sleep(config.POLL_INTERVAL)
 
-    # ----- Yêu cầu 1, 2: Flavor, Image, Network -----
 
     def list_flavors(self):
         return self._request("GET", "compute", "/v2.1/flavors/detail")["flavors"]
@@ -184,10 +227,136 @@ class OpenStackClient:
         body = {"network": {"name": name, "admin_state_up": True}}
         return self._request("POST", "network", "/v2.0/networks", json=body)["network"]
 
-    def delete_network(self, network_id):
+    def _cleanup_subnet_ports(self, subnet_id, logs=None):
+        try:
+            ports = self._request("GET", "network", "/v2.0/ports")["ports"]
+        except Exception:
+            return
+        for p in ports:
+            has_subnet = any(ip.get("subnet_id") == subnet_id for ip in p.get("fixed_ips", []))
+            if not has_subnet:
+                continue
+            owner = p.get("device_owner", "")
+            if owner.startswith("network:router_interface") or owner == "network:ha_router_replicated_interface":
+                router_id = p.get("device_id")
+                if router_id:
+                    self._log(logs, f"Tự động gỡ Router Interface khỏi Subnet (Router: {router_id}, Port: {p['id']})")
+                    try:
+                        self.remove_router_interface(router_id, port_id=p["id"], logs=logs)
+                    except Exception:
+                        try:
+                            self.remove_router_interface(router_id, subnet_id=subnet_id, logs=logs)
+                        except Exception:
+                            pass
+            elif owner.startswith("compute:"):
+                device_id = str(p.get("device_id") or "")
+                port_name = str(p.get("name") or "")
+                if device_id.startswith("lb-") or port_name.startswith("octavia-"):
+                    try:
+                        self._request("DELETE", "network", f"/v2.0/ports/{p['id']}")
+                        self._log(logs, f"Đã tự động giải phóng cổng mồ côi của Load Balancer {p['id']}")
+                        continue
+                    except Exception:
+                        raise OpenStackError(
+                            f"Không thể xóa Subnet/Network vì Load Balancer (Device: {device_id}) đang gắn vào. "
+                            "Vui lòng xóa Load Balancer trước."
+                        )
+                vm_name = device_id
+                try:
+                    srv = self.get_server(device_id)
+                    vm_name = f"'{srv.get('name')}' (ID: {device_id})"
+                except Exception:
+                    pass
+                raise OpenStackError(
+                    f"Không thể xóa Subnet/Network vì máy ảo {vm_name} vẫn đang gắn vào mạng này. "
+                    "Vui lòng xóa máy ảo trước."
+                )
+            elif owner in ("network:dhcp", "network:distributed"):
+                continue
+            else:
+                try:
+                    self._request("DELETE", "network", f"/v2.0/ports/{p['id']}")
+                    self._log(logs, f"Đã tự động giải phóng cổng phụ thuộc {p['id']} ({owner})")
+                except Exception:
+                    device_id = str(p.get("device_id") or "")
+                    if "lb" in owner.lower() or "octavia" in owner.lower() or device_id.startswith("lb-"):
+                        raise OpenStackError(
+                            f"Không thể xóa Subnet/Network vì Load Balancer (Device: {device_id}) đang gắn vào. "
+                            "Vui lòng xóa Load Balancer trước."
+                        )
+
+    def _cleanup_network_ports(self, network_id, logs=None):
+        try:
+            ports = self._request("GET", "network", "/v2.0/ports", params={"network_id": network_id})["ports"]
+        except Exception:
+            return
+        for p in ports:
+            owner = p.get("device_owner", "")
+            if owner.startswith("network:router_interface") or owner == "network:ha_router_replicated_interface":
+                router_id = p.get("device_id")
+                if router_id:
+                    self._log(logs, f"Tự động gỡ Router Interface khỏi Network (Router: {router_id}, Port: {p['id']})")
+                    try:
+                        self.remove_router_interface(router_id, port_id=p["id"], logs=logs)
+                    except Exception:
+                        pass
+            elif owner.startswith("compute:"):
+                device_id = str(p.get("device_id") or "")
+                port_name = str(p.get("name") or "")
+                if device_id.startswith("lb-") or port_name.startswith("octavia-"):
+                    try:
+                        self._request("DELETE", "network", f"/v2.0/ports/{p['id']}")
+                        self._log(logs, f"Đã tự động giải phóng cổng mồ côi của Load Balancer {p['id']}")
+                        continue
+                    except Exception:
+                        raise OpenStackError(
+                            f"Không thể xóa Network vì Load Balancer (Device: {device_id}) đang gắn vào. "
+                            "Vui lòng xóa Load Balancer trước."
+                        )
+                vm_name = device_id
+                try:
+                    srv = self.get_server(device_id)
+                    vm_name = f"'{srv.get('name')}' (ID: {device_id})"
+                except Exception:
+                    pass
+                raise OpenStackError(
+                    f"Không thể xóa Network vì máy ảo {vm_name} vẫn đang gắn vào mạng này. "
+                    "Vui lòng xóa máy ảo trước."
+                )
+            elif owner in ("network:dhcp", "network:distributed"):
+                continue
+            else:
+                try:
+                    self._request("DELETE", "network", f"/v2.0/ports/{p['id']}")
+                    self._log(logs, f"Đã tự động giải phóng cổng phụ thuộc {p['id']} ({owner})")
+                except Exception:
+                    device_id = str(p.get("device_id") or "")
+                    if "lb" in owner.lower() or "octavia" in owner.lower() or device_id.startswith("lb-"):
+                        raise OpenStackError(
+                            f"Không thể xóa Network vì Load Balancer (Device: {device_id}) đang gắn vào. "
+                            "Vui lòng xóa Load Balancer trước."
+                        )
+
+    def delete_subnet(self, subnet_id, logs=None):
+        try:
+            self._request("DELETE", "network", f"/v2.0/subnets/{subnet_id}")
+            return
+        except OpenStackError as exc:
+            if exc.status_code != 409:
+                raise
+            self._cleanup_subnet_ports(subnet_id, logs=logs)
+            self._request("DELETE", "network", f"/v2.0/subnets/{subnet_id}")
+
+    def delete_network(self, network_id, logs=None):
         for subnet in self.list_subnets(network_id=network_id):
-            self.delete_subnet(subnet["id"])
-        self._request("DELETE", "network", f"/v2.0/networks/{network_id}")
+            self.delete_subnet(subnet["id"], logs=logs)
+        try:
+            self._request("DELETE", "network", f"/v2.0/networks/{network_id}")
+        except OpenStackError as exc:
+            if exc.status_code != 409:
+                raise
+            self._cleanup_network_ports(network_id, logs=logs)
+            self._request("DELETE", "network", f"/v2.0/networks/{network_id}")
 
     def get_external_network_id(self):
         nets = self._request(
@@ -222,9 +391,6 @@ class OpenStackClient:
             subnet["dns_nameservers"] = dns_nameservers
         return self._request("POST", "network", "/v2.0/subnets", json={"subnet": subnet})["subnet"]
 
-    def delete_subnet(self, subnet_id):
-        self._request("DELETE", "network", f"/v2.0/subnets/{subnet_id}")
-
     def list_routers(self, name=None):
         params = {"name": name} if name else None
         return self._request("GET", "network", "/v2.0/routers", params=params)["routers"]
@@ -241,11 +407,67 @@ class OpenStackClient:
             json={"subnet_id": subnet_id},
         )
 
-    def remove_router_interface(self, router_id, subnet_id=None, port_id=None):
+    def _disassociate_router_floating_ips(self, router_id, subnet_id=None, port_id=None, logs=None):
+        try:
+            fips = self._request("GET", "network", "/v2.0/floatingips")["floatingips"]
+        except Exception:
+            return
+
+        target_port_ids = set()
+        if port_id:
+            target_port_ids.add(port_id)
+        elif subnet_id:
+            try:
+                ports = self._request("GET", "network", "/v2.0/ports")["ports"]
+                for p in ports:
+                    if any(ip.get("subnet_id") == subnet_id for ip in p.get("fixed_ips", [])):
+                        target_port_ids.add(p["id"])
+            except Exception:
+                pass
+
+        for f in fips:
+            if not f.get("port_id"):
+                continue
+            is_match = False
+            if target_port_ids and f.get("port_id") in target_port_ids:
+                is_match = True
+            elif not target_port_ids and f.get("router_id") == router_id:
+                is_match = True
+
+            if is_match:
+                self._log(
+                    logs,
+                    f"Tự động gỡ liên kết Floating IP {f['floating_ip_address']} để giải phóng Router Interface",
+                )
+                try:
+                    self._request(
+                        "PUT",
+                        "network",
+                        f"/v2.0/floatingips/{f['id']}",
+                        json={"floatingip": {"port_id": None}},
+                    )
+                except Exception:
+                    pass
+
+    def remove_router_interface(self, router_id, subnet_id=None, port_id=None, logs=None):
         body = {"subnet_id": subnet_id} if subnet_id else {"port_id": port_id}
-        return self._request(
-            "PUT", "network", f"/v2.0/routers/{router_id}/remove_router_interface", json=body
-        )
+        try:
+            return self._request(
+                "PUT", "network", f"/v2.0/routers/{router_id}/remove_router_interface", json=body
+            )
+        except OpenStackError as exc:
+            if exc.status_code == 409 and "floating ip" in str(exc).lower():
+                self._log(
+                    logs,
+                    f"Phát hiện Floating IP đang phụ thuộc vào Router {router_id}, tiến hành tự động gỡ Floating IP...",
+                )
+                self._disassociate_router_floating_ips(
+                    router_id, subnet_id=subnet_id, port_id=port_id, logs=logs
+                )
+                return self._request(
+                    "PUT", "network", f"/v2.0/routers/{router_id}/remove_router_interface", json=body
+                )
+            raise
 
     def _router_ports(self, router_id):
         return self._request(
@@ -253,12 +475,11 @@ class OpenStackClient:
             params={"device_id": router_id, "device_owner": "network:router_interface"},
         )["ports"]
 
-    def delete_router(self, router_id):
+    def delete_router(self, router_id, logs=None):
         for port in self._router_ports(router_id):
-            self.remove_router_interface(router_id, port_id=port["id"])
+            self.remove_router_interface(router_id, port_id=port["id"], logs=logs)
         self._request("DELETE", "network", f"/v2.0/routers/{router_id}")
 
-    # ----- Yêu cầu 4, 6: Instance, Floating IP -----
 
     @staticmethod
     def _simplify_server(server):
@@ -275,6 +496,18 @@ class OpenStackClient:
             "floating_ips": floating,
         }
 
+
+    def list_keypairs(self):
+        data = self._request("GET", "compute", "/v2.1/os-keypairs")
+        return [kp["keypair"] for kp in data.get("keypairs", [])]
+
+    def create_keypair(self, name):
+        body = {"keypair": {"name": name}}
+        return self._request("POST", "compute", "/v2.1/os-keypairs", json=body)["keypair"]
+
+    def delete_keypair(self, name):
+        self._request("DELETE", "compute", f"/v2.1/os-keypairs/{name}")
+
     def list_servers(self):
         data = self._request("GET", "compute", "/v2.1/servers/detail")
         return [self._simplify_server(s) for s in data["servers"]]
@@ -283,12 +516,21 @@ class OpenStackClient:
         data = self._request("GET", "compute", f"/v2.1/servers/{server_id}")
         return self._simplify_server(data["server"])
 
-    def create_server(self, name, image_id, flavor_id, network_id, user_data=None, key_name=None):
+    def create_server(self, name, image_id, flavor_id, network_id, user_data=None, key_name=None, volume_size=10):
         server = {
             "name": name,
-            "imageRef": image_id,
             "flavorRef": flavor_id,
             "networks": [{"uuid": network_id}],
+            "block_device_mapping_v2": [
+                {
+                    "source_type": "image",
+                    "destination_type": "volume",
+                    "uuid": image_id,
+                    "boot_index": 0,
+                    "volume_size": volume_size,
+                    "delete_on_termination": True,
+                }
+            ],
         }
         if user_data:
             server["user_data"] = user_data
@@ -298,6 +540,12 @@ class OpenStackClient:
 
     def delete_server(self, server_id):
         self._request("DELETE", "compute", f"/v2.1/servers/{server_id}")
+
+    def start_server(self, server_id):
+        self._request("POST", "compute", f"/v2.1/servers/{server_id}/action", json={"os-start": None})
+
+    def stop_server(self, server_id):
+        self._request("POST", "compute", f"/v2.1/servers/{server_id}/action", json={"os-stop": None})
 
     def wait_for_server_active(self, server_id):
         """Chờ server ACTIVE và có IP nội bộ, trả về IP đó."""
@@ -337,17 +585,23 @@ class OpenStackClient:
         number = vms[-1]["index"] + 1 if vms else 1
         return f"{config.VM_PREFIX}{number}"
 
-    def create_vm(self, name, image_id, flavor_id, web=False, logs=None):
+    def create_vm(self, name, image_id, flavor_id, web=False, key_name=None, logs=None):
         network = self._require_network()
         user_data = encode_user_data(WEB_USER_DATA_SCRIPT) if web else None
-        server = self.create_server(name, image_id, flavor_id, network["id"], user_data=user_data)
+        if key_name:
+            self._log(logs, f"Gắn SSH Keypair '{key_name}' vào máy ảo")
+        server = self.create_server(
+            name, image_id, flavor_id, network["id"], user_data=user_data, key_name=key_name
+        )
         self._log(logs, f"Đã gửi yêu cầu tạo máy ảo {name} (id {server['id']})")
         ip = self.wait_for_server_active(server["id"])
-        self._log(logs, f"Máy ảo {name} ACTIVE, IP nội bộ {ip}")
-        return {"server_id": server["id"], "name": name, "ip": ip}
+        res = {"server_id": server["id"], "name": name, "ip": ip}
+        if key_name:
+            res["key_name"] = key_name
+        return res
 
-    def create_web_vm(self, name, image_id, flavor_id, logs=None):
-        return self.create_vm(name, image_id, flavor_id, web=True, logs=logs)
+    def create_web_vm(self, name, image_id, flavor_id, key_name=None, logs=None):
+        return self.create_vm(name, image_id, flavor_id, web=True, key_name=key_name, logs=logs)
 
     def _create_floating_ip(self, port_id):
         external_id = self.get_external_network_id()
@@ -365,7 +619,29 @@ class OpenStackClient:
         self._log(logs, f"Đã gán Floating IP {address} cho máy ảo {server_id}")
         return {"server_id": server_id, "floating_ip": address}
 
-    # ----- Yêu cầu 5: Thiết lập mạng 1-Click -----
+    def disassociate_floating_ip(self, server_id, logs=None):
+        ports = self._request(
+            "GET", "network", "/v2.0/ports", params={"device_id": server_id}
+        )["ports"]
+        if not ports:
+            raise OpenStackError(f"Không tìm thấy port của máy ảo {server_id}")
+        port_ids = {p["id"] for p in ports}
+        fips = self._request("GET", "network", "/v2.0/floatingips")["floatingips"]
+        detached = []
+        for f in fips:
+            if f.get("port_id") in port_ids:
+                self._request(
+                    "PUT",
+                    "network",
+                    f"/v2.0/floatingips/{f['id']}",
+                    json={"floatingip": {"port_id": None}},
+                )
+                detached.append(f["floating_ip_address"])
+                self._log(logs, f"Đã gỡ Floating IP {f['floating_ip_address']} khỏi máy ảo {server_id}")
+        if not detached:
+            self._log(logs, f"Máy ảo {server_id} không có Floating IP nào đang gắn")
+        return {"server_id": server_id, "disassociated": detached}
+
 
     @staticmethod
     def _rule_matches(rule, protocol, port):
@@ -466,7 +742,6 @@ class OpenStackClient:
         self.ensure_default_sg_rules(logs)
         return {"network_id": net["id"], "subnet_id": subnet["id"], "router_id": router["id"]}
 
-    # ----- Yêu cầu 7: Octavia Load Balancer -----
 
     def wait_for_lb_active(self, lb_id):
         """Polling provisioning_status == ACTIVE (mỗi POLL_INTERVAL giây, tối đa POLL_TIMEOUT giây)."""
@@ -486,20 +761,50 @@ class OpenStackClient:
             lambda: f"Load Balancer {lb_id} đạt ACTIVE (trạng thái hiện tại: {state['status']})",
         )
 
-    def find_lb(self):
+    def find_lb(self, name=None):
+        target = name or config.LB_NAME
         lbs = self._request(
-            "GET", "load-balancer", "/v2.0/lbaas/loadbalancers", params={"name": config.LB_NAME}
+            "GET", "load-balancer", "/v2.0/lbaas/loadbalancers", params={"name": target}
         )["loadbalancers"]
-        return self._find_by_name(lbs, config.LB_NAME)
+        return self._find_by_name(lbs, target)
 
-    def _require_lb(self):
-        lb = self.find_lb()
+    def list_loadbalancers(self):
+        lbs = self._request("GET", "load-balancer", "/v2.0/lbaas/loadbalancers")["loadbalancers"]
+        fip_map = {}
+        try:
+            fips = self._request("GET", "network", "/v2.0/floatingips")["floatingips"]
+            for f in fips:
+                if f.get("port_id"):
+                    fip_map[f["port_id"]] = f["floating_ip_address"]
+        except Exception:
+            pass
+
+        result = []
+        for lb in lbs:
+            vip_port = lb.get("vip_port_id")
+            result.append({
+                "id": lb["id"],
+                "name": lb.get("name") or "(không tên)",
+                "provisioning_status": lb.get("provisioning_status", "UNKNOWN"),
+                "operating_status": lb.get("operating_status", "UNKNOWN"),
+                "vip_address": lb.get("vip_address"),
+                "vip_port_id": vip_port,
+                "floating_ip": fip_map.get(vip_port),
+                "provider": lb.get("provider", "ovn"),
+                "listeners": lb.get("listeners", []),
+                "pools": lb.get("pools", []),
+            })
+        return result
+
+    def _require_lb(self, name=None):
+        target = name or config.LB_NAME
+        lb = self.find_lb(target)
         if not lb:
             raise OpenStackError(
-                f"Chưa có Load Balancer '{config.LB_NAME}', hãy tạo Load Balancer trước"
+                f"Chưa có Load Balancer '{target}', hãy tạo Load Balancer trước"
             )
         if not lb.get("pools"):
-            raise OpenStackError(f"Load Balancer '{config.LB_NAME}' chưa có Pool")
+            raise OpenStackError(f"Load Balancer '{target}' chưa có Pool")
         return lb, lb["pools"][0]["id"]
 
     def list_pool_members(self, pool_id):
@@ -525,11 +830,35 @@ class OpenStackClient:
         self.wait_for_lb_active(lb_id)
         self._log(logs, f"Đã xóa member {member_id} khỏi Pool của Load Balancer")
 
-    def create_load_balancer(self, logs=None):
-        if self.find_lb():
+    def delete_load_balancer(self, lb_id, cascade=True, logs=None):
+        try:
+            lb_data = self._request("GET", "load-balancer", f"/v2.0/lbaas/loadbalancers/{lb_id}")["loadbalancer"]
+            if lb_data.get("provisioning_status") not in ("ACTIVE", "ERROR"):
+                self.wait_for_lb_active(lb_id)
+            vip_port_id = lb_data.get("vip_port_id")
+            if vip_port_id:
+                try:
+                    fips = self._request("GET", "network", "/v2.0/floatingips")["floatingips"]
+                    for f in fips:
+                        if f.get("port_id") == vip_port_id:
+                            self._request("DELETE", "network", f"/v2.0/floatingips/{f['id']}")
+                            self._log(logs, f"Đã xóa Floating IP {f['floating_ip_address']} gắn trên VIP của Load Balancer")
+                except Exception as e:
+                    self._log(logs, f"Kiểm tra/xóa Floating IP VIP: {e}")
+        except Exception:
+            pass
+
+        params = {"cascade": "true"} if cascade else None
+        self._request("DELETE", "load-balancer", f"/v2.0/lbaas/loadbalancers/{lb_id}", params=params)
+        self._log(logs, f"Đã gửi yêu cầu xóa Load Balancer {lb_id} (cascade={cascade})")
+
+    def create_load_balancer(self, logs=None, name=None):
+        lb_name = (name or "").strip() or config.LB_NAME
+        if self.find_lb(lb_name):
             raise OpenStackError(
-                f"Load Balancer '{config.LB_NAME}' đã tồn tại, hãy dùng Scale Out/Scale In"
+                f"Load Balancer '{lb_name}' đã tồn tại, hãy dùng Scale Out/Scale In"
             )
+
         network = self._require_network()
         subnet = self._find_by_name(
             self.list_subnets(network_id=network["id"], name=config.SUBNET_NAME), config.SUBNET_NAME
@@ -539,37 +868,81 @@ class OpenStackClient:
                 f"Chưa có subnet '{config.SUBNET_NAME}', hãy chạy Thiết lập mạng 1-Click trước"
             )
 
+        lb_body = {"name": lb_name, "vip_subnet_id": subnet["id"]}
+        if getattr(config, "LB_PROVIDER", None):
+            lb_body["provider"] = config.LB_PROVIDER
+
         lb = self._request(
             "POST", "load-balancer", "/v2.0/lbaas/loadbalancers",
-            json={"loadbalancer": {"name": config.LB_NAME, "vip_subnet_id": subnet["id"]}},
+            json={"loadbalancer": lb_body},
         )["loadbalancer"]
-        self._log(logs, f"Đã gửi yêu cầu tạo Load Balancer {config.LB_NAME} ({lb['id']})")
+        self._log(logs, f"Đã gửi yêu cầu tạo Load Balancer {lb_name} ({lb['id']})")
         lb = self.wait_for_lb_active(lb["id"])
         self._log(logs, "Load Balancer ACTIVE")
 
-        listener = self._request(
-            "POST", "load-balancer", "/v2.0/lbaas/listeners",
-            json={"listener": {
-                "name": f"{config.LB_NAME}_listener",
-                "protocol": "HTTP",
-                "protocol_port": 80,
-                "loadbalancer_id": lb["id"],
-            }},
-        )["listener"]
-        self.wait_for_lb_active(lb["id"])
-        self._log(logs, f"Đã tạo Listener HTTP:80 ({listener['id']})")
+        protocol = "HTTP"
+        lb_algorithm = "ROUND_ROBIN"
 
-        pool = self._request(
-            "POST", "load-balancer", "/v2.0/lbaas/pools",
-            json={"pool": {
-                "name": f"{config.LB_NAME}_pool",
-                "protocol": "HTTP",
-                "lb_algorithm": "ROUND_ROBIN",
-                "listener_id": listener["id"],
-            }},
-        )["pool"]
-        self.wait_for_lb_active(lb["id"])
-        self._log(logs, f"Đã tạo Pool ROUND_ROBIN ({pool['id']})")
+        try:
+            listener = self._request(
+                "POST", "load-balancer", "/v2.0/lbaas/listeners",
+                json={"listener": {
+                    "name": f"{lb_name}_listener",
+                    "protocol": "HTTP",
+                    "protocol_port": 80,
+                    "loadbalancer_id": lb["id"],
+                }},
+            )["listener"]
+            self.wait_for_lb_active(lb["id"])
+            self._log(logs, f"Đã tạo Listener HTTP:80 ({listener['id']})")
+        except OpenStackError as exc:
+            if exc.status_code == 501 and ("ovn" in str(exc).lower() or "protocol" in str(exc).lower()):
+                self._log(logs, "Octavia OVN provider chỉ hỗ trợ giao thức L4 (TCP). Tự động chuyển sang TCP:80...")
+                protocol = "TCP"
+                lb_algorithm = "SOURCE_IP_PORT"
+                listener = self._request(
+                    "POST", "load-balancer", "/v2.0/lbaas/listeners",
+                    json={"listener": {
+                        "name": f"{lb_name}_listener",
+                        "protocol": "TCP",
+                        "protocol_port": 80,
+                        "loadbalancer_id": lb["id"],
+                    }},
+                )["listener"]
+                self.wait_for_lb_active(lb["id"])
+                self._log(logs, f"Đã tạo Listener TCP:80 ({listener['id']})")
+            else:
+                raise
+
+        try:
+            pool = self._request(
+                "POST", "load-balancer", "/v2.0/lbaas/pools",
+                json={"pool": {
+                    "name": f"{lb_name}_pool",
+                    "protocol": protocol,
+                    "lb_algorithm": lb_algorithm,
+                    "listener_id": listener["id"],
+                }},
+            )["pool"]
+            self.wait_for_lb_active(lb["id"])
+            self._log(logs, f"Đã tạo Pool {lb_algorithm} ({pool['id']})")
+        except OpenStackError as exc:
+            if exc.status_code == 501 and ("ovn" in str(exc).lower() or "algorithm" in str(exc).lower()):
+                self._log(logs, "Octavia OVN provider yêu cầu thuật toán SOURCE_IP_PORT. Tự động chuyển đổi...")
+                lb_algorithm = "SOURCE_IP_PORT"
+                pool = self._request(
+                    "POST", "load-balancer", "/v2.0/lbaas/pools",
+                    json={"pool": {
+                        "name": f"{lb_name}_pool",
+                        "protocol": "TCP" if protocol == "HTTP" else protocol,
+                        "lb_algorithm": lb_algorithm,
+                        "listener_id": listener["id"],
+                    }},
+                )["pool"]
+                self.wait_for_lb_active(lb["id"])
+                self._log(logs, f"Đã tạo Pool {lb_algorithm} ({pool['id']})")
+            else:
+                raise
 
         members = []
         for vm in self.list_nhom17_vms():
@@ -590,7 +963,6 @@ class OpenStackClient:
             "members": members,
         }
 
-    # ----- Yêu cầu 8: Scale Out / Scale In -----
 
     def scale_out(self, logs=None):
         if not config.DEFAULT_IMAGE_ID or not config.DEFAULT_FLAVOR_ID:

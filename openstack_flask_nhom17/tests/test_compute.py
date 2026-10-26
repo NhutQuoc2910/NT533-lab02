@@ -50,9 +50,18 @@ def test_create_server_payload_without_key_name(mocked, client):
     server = last_body(mocked)["server"]
     assert server == {
         "name": "nhom17_vm_1",
-        "imageRef": "img1",
         "flavorRef": "flv1",
         "networks": [{"uuid": "n1"}],
+        "block_device_mapping_v2": [
+            {
+                "source_type": "image",
+                "destination_type": "volume",
+                "uuid": "img1",
+                "boot_index": 0,
+                "volume_size": 10,
+                "delete_on_termination": True,
+            }
+        ],
     }
 
 
@@ -165,3 +174,55 @@ def test_assign_floating_ip_without_port_raises(mocked, client):
 
 def test_encode_user_data_roundtrip():
     assert base64.b64decode(encode_user_data("héllo")).decode("utf-8") == "héllo"
+
+
+def test_list_keypairs(mocked, client):
+    mocked.add(
+        responses.GET,
+        f"{COMPUTE}/v2.1/os-keypairs",
+        json={"keypairs": [{"keypair": {"name": "k1", "public_key": "ssh-rsa AAA..."}}]},
+    )
+    res = client.list_keypairs()
+    assert res == [{"name": "k1", "public_key": "ssh-rsa AAA..."}]
+
+
+def test_create_keypair(mocked, client):
+    mocked.add(
+        responses.POST,
+        f"{COMPUTE}/v2.1/os-keypairs",
+        json={"keypair": {"name": "k1", "private_key": "-----BEGIN RSA PRIVATE KEY-----"}},
+    )
+    res = client.create_keypair("k1")
+    assert res["name"] == "k1"
+    assert "private_key" in res
+    assert last_body(mocked) == {"keypair": {"name": "k1"}}
+
+
+def test_delete_keypair(mocked, client):
+    mocked.add(responses.DELETE, f"{COMPUTE}/v2.1/os-keypairs/k1", status=204)
+    client.delete_keypair("k1")
+
+
+def test_disassociate_floating_ip(mocked, client):
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/ports", json={"ports": [{"id": "p1"}]})
+    mocked.add(
+        responses.GET, f"{NETWORK}/v2.0/floatingips",
+        json={"floatingips": [{"id": "f1", "port_id": "p1", "floating_ip_address": "10.0.0.5"}]},
+    )
+    mocked.add(responses.PUT, f"{NETWORK}/v2.0/floatingips/f1", json={"floatingip": {"port_id": None}})
+    logs = []
+    res = client.disassociate_floating_ip("srv1", logs=logs)
+    assert res == {"server_id": "srv1", "disassociated": ["10.0.0.5"]}
+
+
+def test_start_server(mocked, client):
+    mocked.add(responses.POST, f"{COMPUTE}/v2.1/servers/srv1/action", json={})
+    client.start_server("srv1")
+    assert last_body(mocked) == {"os-start": None}
+
+
+def test_stop_server(mocked, client):
+    mocked.add(responses.POST, f"{COMPUTE}/v2.1/servers/srv1/action", json={})
+    client.stop_server("srv1")
+    assert last_body(mocked) == {"os-stop": None}
+

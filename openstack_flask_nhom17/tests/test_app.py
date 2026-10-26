@@ -128,15 +128,57 @@ def test_delete_routes(fake, http):
     fake.delete_router.assert_called_once_with("r1")
     assert http.delete("/api/servers/v1").get_json()["success"]
     fake.delete_server.assert_called_once_with("v1")
+    assert http.delete("/api/loadbalancers/lb1").get_json()["success"]
+    assert fake.delete_load_balancer.call_count == 1
+    assert fake.delete_load_balancer.call_args[0][0] == "lb1"
+    assert fake.delete_load_balancer.call_args[1]["cascade"] is True
 
 
 def test_setup_loadbalancer_and_scale_routes(fake, http):
     fake.setup_network_1click.return_value = {"network_id": "n1"}
     fake.create_load_balancer.return_value = {"lb_id": "lb1"}
+    fake.list_loadbalancers.return_value = [{"id": "lb1", "name": "nhom17_lb"}]
     fake.scale_out.return_value = {"name": "nhom17_vm_2"}
     fake.scale_in.return_value = {"deleted": "nhom17_vm_2"}
+    assert http.get("/api/loadbalancers").get_json()["data"] == {"items": [{"id": "lb1", "name": "nhom17_lb"}]}
     assert http.post("/api/setup").get_json()["data"] == {"network_id": "n1"}
     assert http.post("/api/loadbalancer").get_json()["data"] == {"lb_id": "lb1"}
+    assert fake.create_load_balancer.call_args.kwargs == {"name": None}
+    assert http.post("/api/loadbalancer", json={"name": "custom_lb"}).get_json()["data"] == {"lb_id": "lb1"}
+    assert fake.create_load_balancer.call_args.kwargs == {"name": "custom_lb"}
     assert http.post("/api/scale-out").get_json()["data"] == {"name": "nhom17_vm_2"}
     assert http.post("/api/scale-in", json={"server_id": "srv2"}).get_json()["data"] == {"deleted": "nhom17_vm_2"}
     assert fake.scale_in.call_args.kwargs == {"server_id": "srv2"}
+
+
+def test_keypair_routes(fake, http):
+    fake.list_keypairs.return_value = [{"name": "kp1"}]
+    fake.create_keypair.return_value = {"name": "kp2", "private_key": "MIIE..."}
+    assert http.get("/api/keypairs").get_json()["data"] == {"items": [{"name": "kp1"}]}
+    res = http.post("/api/keypairs", json={"name": "kp2"}).get_json()
+    assert res["success"] is True
+    assert res["data"]["item"]["name"] == "kp2"
+
+
+def test_create_vm_with_auto_keypair(fake, http):
+    fake.create_keypair.return_value = {"name": "myvm_key", "private_key": "-----BEGIN RSA PRIVATE KEY-----"}
+    fake.create_vm.return_value = {"server_id": "s1", "name": "myvm", "ip": "192.168.17.10"}
+    res = http.post(
+        "/api/servers",
+        json={"name": "myvm", "image_id": "img1", "flavor_id": "flv1", "key_mode": "auto"},
+    ).get_json()
+    assert res["success"] is True
+    assert res["data"]["keypair"]["name"] == "myvm_key"
+    assert res["data"]["keypair"]["private_key"] == "-----BEGIN RSA PRIVATE KEY-----"
+    fake.create_keypair.assert_called_once_with("myvm_key")
+    _, kwargs = fake.create_vm.call_args
+    assert kwargs["key_name"] == "myvm_key"
+
+
+def test_disassociate_floating_ip_route(fake, http):
+    fake.disassociate_floating_ip.return_value = {"server_id": "s1", "disassociated": ["10.0.0.5"]}
+    res = http.delete("/api/servers/s1/floating-ip").get_json()
+    assert res["success"] is True
+    assert res["data"]["disassociated"] == ["10.0.0.5"]
+
+

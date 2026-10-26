@@ -53,7 +53,7 @@ def test_scale_out_creates_vm_and_adds_member(mocked, client, defaults):
         [c for c in mocked.calls if c.request.method == "POST" and c.request.url.endswith("/servers")][0].request.body
     )["server"]
     assert server_body["name"] == "nhom17_vm_2"
-    assert server_body["imageRef"] == "img1"
+    assert server_body["block_device_mapping_v2"][0]["uuid"] == "img1"
     assert server_body["flavorRef"] == "flv1"
     assert "user_data" in server_body
 

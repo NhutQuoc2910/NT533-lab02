@@ -129,3 +129,98 @@ def test_delete_router_detaches_interfaces_first(mocked, client):
         ("PUT", f"{NETWORK}/v2.0/routers/r1/remove_router_interface"),
         ("DELETE", f"{NETWORK}/v2.0/routers/r1"),
     ]
+
+
+def test_delete_subnet_on_409_detaches_router_interface(mocked, client):
+    # First DELETE fails with 409 Conflict
+    mocked.add(
+        responses.DELETE, f"{NETWORK}/v2.0/subnets/s1",
+        status=409, json={"NeutronError": {"message": "One or more ports have an IP allocation"}},
+    )
+    # Query ports finds router interface
+    mocked.add(
+        responses.GET, f"{NETWORK}/v2.0/ports",
+        json={"ports": [{
+            "id": "p1",
+            "device_owner": "network:router_interface",
+            "device_id": "r1",
+            "fixed_ips": [{"subnet_id": "s1", "ip_address": "192.168.17.1"}],
+        }]},
+    )
+    # Detach router interface
+    mocked.add(responses.PUT, f"{NETWORK}/v2.0/routers/r1/remove_router_interface", json={})
+    # Second DELETE succeeds
+    mocked.add(responses.DELETE, f"{NETWORK}/v2.0/subnets/s1", status=204)
+
+    logs = []
+    client.delete_subnet("s1", logs=logs)
+    assert any("Tự động gỡ Router Interface" in l for l in logs)
+
+
+def test_delete_subnet_on_409_with_vm_raises_friendly_error(mocked, client):
+    mocked.add(
+        responses.DELETE, f"{NETWORK}/v2.0/subnets/s1",
+        status=409, json={"NeutronError": {"message": "One or more ports have an IP allocation"}},
+    )
+    mocked.add(
+        responses.GET, f"{NETWORK}/v2.0/ports",
+        json={"ports": [{
+            "id": "p1",
+            "device_owner": "compute:nova",
+            "device_id": "vm1",
+            "fixed_ips": [{"subnet_id": "s1", "ip_address": "192.168.17.10"}],
+        }]},
+    )
+    with pytest.raises(OpenStackError) as exc_info:
+        client.delete_subnet("s1")
+    assert "máy ảo" in str(exc_info.value)
+
+
+def test_remove_router_interface_on_409_disassociates_floating_ip(mocked, client):
+    # First remove fails with 409 floating ip required
+    mocked.add(
+        responses.PUT, f"{NETWORK}/v2.0/routers/r1/remove_router_interface",
+        status=409, json={"NeutronError": {"message": "cannot be deleted, as it is required by one or more floating IPs"}},
+    )
+    # Query floating ips
+    mocked.add(
+        responses.GET, f"{NETWORK}/v2.0/floatingips",
+        json={"floatingips": [{"id": "f1", "router_id": "r1", "port_id": "p1", "floating_ip_address": "10.0.0.5"}]},
+    )
+    # Disassociate floating ip
+    mocked.add(responses.PUT, f"{NETWORK}/v2.0/floatingips/f1", json={"floatingip": {"port_id": None}})
+    # Second remove succeeds
+    mocked.add(responses.PUT, f"{NETWORK}/v2.0/routers/r1/remove_router_interface", json={})
+
+    logs = []
+    client.remove_router_interface("r1", port_id="p1", logs=logs)
+    assert any("Floating IP" in l for l in logs)
+
+
+def test_delete_subnet_on_409_cleans_up_ovn_lb_hm_port(mocked, client):
+    # First DELETE fails with 409
+    mocked.add(
+        responses.DELETE, f"{NETWORK}/v2.0/subnets/s1",
+        status=409, json={"NeutronError": {"message": "One or more ports have an IP allocation"}},
+    )
+    # Query ports returns ovn-lb-hm port
+    mocked.add(
+        responses.GET, f"{NETWORK}/v2.0/ports",
+        json={"ports": [{
+            "id": "p_hm",
+            "device_owner": "ovn-lb-hm:distributed",
+            "device_id": "ovn-lb-hm-s1",
+            "fixed_ips": [{"subnet_id": "s1", "ip_address": "192.168.1.35"}],
+        }]},
+    )
+    # Port p_hm is automatically deleted
+    mocked.add(responses.DELETE, f"{NETWORK}/v2.0/ports/p_hm", status=204)
+    # Retry DELETE subnet succeeds
+    mocked.add(responses.DELETE, f"{NETWORK}/v2.0/subnets/s1", status=204)
+
+    logs = []
+    client.delete_subnet("s1", logs=logs)
+    assert any("giải phóng cổng phụ thuộc" in l for l in logs)
+
+
+

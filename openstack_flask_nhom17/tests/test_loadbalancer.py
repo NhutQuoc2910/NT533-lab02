@@ -51,7 +51,7 @@ def test_wait_for_lb_active_timeout(mocked, client):
     assert "PENDING_UPDATE" in exc.value.message
 
 
-def mock_create_flow(mocked):
+def mock_create_flow(mocked, ovn=False):
     mocked.add(responses.GET, LB_URL, match=[matchers.query_param_matcher({"name": config.LB_NAME})],
                json={"loadbalancers": []})
     mocked.add(responses.GET, f"{NETWORK}/v2.0/networks",
@@ -72,11 +72,25 @@ def mock_create_flow(mocked):
     ]})
     mocked.add(responses.POST, LB_URL, json=lb_json("PENDING_CREATE"))
     mocked.add(responses.GET, f"{LB_URL}/lb1", json=lb_json())
-    mocked.add(responses.POST, f"{LB}/v2.0/lbaas/listeners", json={"listener": {"id": "l1"}})
-    mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools", json={"pool": {"id": "p1"}})
-    mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools/p1/members", json={"member": {"id": "m1"}})
+    if ovn:
+        mocked.add(
+            responses.POST, f"{LB}/v2.0/lbaas/listeners",
+            status=501, json={"NeutronError": {"message": "Provider 'ovn' does not support HTTP protocol"}},
+        )
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/listeners", json={"listener": {"id": "l_tcp"}})
+        mocked.add(
+            responses.POST, f"{LB}/v2.0/lbaas/pools",
+            status=501, json={"NeutronError": {"message": "Provider 'ovn' does not support ROUND_ROBIN algorithm"}},
+        )
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools", json={"pool": {"id": "p_ovn"}})
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools/p_ovn/members", json={"member": {"id": "m1"}})
+    else:
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/listeners", json={"listener": {"id": "l1"}})
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools", json={"pool": {"id": "p1"}})
+        mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools/p1/members", json={"member": {"id": "m1"}})
     mocked.add(responses.POST, f"{NETWORK}/v2.0/floatingips",
                json={"floatingip": {"floating_ip_address": "10.0.0.5"}})
+
 
 
 def bodies_for(mocked, suffix):
@@ -141,3 +155,86 @@ def test_remove_pool_member_waits_before_and_after(mocked, client):
     mocked.add(responses.DELETE, f"{LB}/v2.0/lbaas/pools/p1/members/m9", status=204)
     client.remove_pool_member("lb1", "p1", "m9", [])
     assert [c[0] for c in calls_summary(mocked)] == ["GET", "DELETE", "GET"]
+
+
+def test_create_load_balancer_ovn_fallback_to_tcp_and_source_ip_port(mocked, client):
+    mock_create_flow(mocked, ovn=True)
+    logs = []
+    res = client.create_load_balancer(logs)
+    assert res["lb_id"] == "lb1"
+    assert res["pool_id"] == "p_ovn"
+    assert any("TCP" in l for l in logs)
+    assert any("SOURCE_IP_PORT" in l for l in logs)
+
+
+def test_list_loadbalancers(mocked, client):
+    mocked.add(responses.GET, LB_URL, json={"loadbalancers": [
+        {
+            "id": "lb1",
+            "name": "nhom17_lb",
+            "provisioning_status": "ACTIVE",
+            "operating_status": "ONLINE",
+            "vip_address": "192.168.17.50",
+            "vip_port_id": "vp1",
+            "provider": "ovn",
+            "listeners": [{"id": "l1"}],
+            "pools": [{"id": "p1"}],
+        }
+    ]})
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/floatingips", json={"floatingips": [
+        {"id": "fip1", "floating_ip_address": "10.0.0.5", "port_id": "vp1"}
+    ]})
+    items = client.list_loadbalancers()
+    assert len(items) == 1
+    assert items[0]["id"] == "lb1"
+    assert items[0]["name"] == "nhom17_lb"
+    assert items[0]["floating_ip"] == "10.0.0.5"
+    assert items[0]["provisioning_status"] == "ACTIVE"
+
+
+def test_delete_load_balancer_deletes_fip_and_lb(mocked, client):
+    mocked.add(responses.GET, f"{LB_URL}/lb1", json={"loadbalancer": {
+        "id": "lb1", "provisioning_status": "ACTIVE", "vip_port_id": "vp1"
+    }})
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/floatingips", json={"floatingips": [
+        {"id": "fip1", "floating_ip_address": "10.0.0.5", "port_id": "vp1"}
+    ]})
+    mocked.add(responses.DELETE, f"{NETWORK}/v2.0/floatingips/fip1", status=204)
+    mocked.add(responses.DELETE, f"{LB_URL}/lb1", match=[matchers.query_param_matcher({"cascade": "true"})], status=204)
+
+    logs = []
+    client.delete_load_balancer("lb1", cascade=True, logs=logs)
+    calls = calls_summary(mocked)
+    assert ("DELETE", f"{NETWORK}/v2.0/floatingips/fip1") in calls
+    assert ("DELETE", f"{LB_URL}/lb1") in calls
+    assert any("Đã gửi yêu cầu xóa Load Balancer" in l for l in logs)
+
+
+def test_create_load_balancer_custom_name(mocked, client):
+    custom_name = "test_custom_lb"
+    mocked.add(responses.GET, LB_URL, match=[matchers.query_param_matcher({"name": custom_name})],
+               json={"loadbalancers": []})
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/networks",
+               match=[matchers.query_param_matcher({"name": config.NET_NAME})],
+               json={"networks": [{"id": "n1", "name": config.NET_NAME}]})
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/networks",
+               match=[matchers.query_param_matcher({"router:external": "true"})],
+               json={"networks": [{"id": "ext1"}]})
+    mocked.add(responses.GET, f"{NETWORK}/v2.0/subnets",
+               json={"subnets": [{"id": "s1", "name": config.SUBNET_NAME}]})
+    mocked.add(responses.GET, f"{COMPUTE}/v2.1/servers/detail", json={"servers": []})
+    mocked.add(responses.POST, LB_URL, json=lb_json())
+    mocked.add(responses.GET, f"{LB_URL}/lb1", json=lb_json())
+    mocked.add(responses.POST, f"{LB}/v2.0/lbaas/listeners", json={"listener": {"id": "l_custom"}})
+    mocked.add(responses.POST, f"{LB}/v2.0/lbaas/pools", json={"pool": {"id": "p_custom"}})
+    mocked.add(responses.POST, f"{NETWORK}/v2.0/floatingips",
+               json={"floatingip": {"floating_ip_address": "10.0.0.9"}})
+
+    logs = []
+    res = client.create_load_balancer(logs, name=custom_name)
+    assert res["lb_id"] == "lb1"
+    create_lb_body = bodies_for(mocked, "/loadbalancers")[0]["loadbalancer"]
+    assert create_lb_body["name"] == custom_name
+
+
+

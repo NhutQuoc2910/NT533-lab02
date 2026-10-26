@@ -21,9 +21,17 @@
 </head>
 <body>
   <header class="topbar py-3 mb-4">
-    <div class="container-fluid px-4">
-      <h1 class="h4 mb-0">Nhóm 17 - NT533: OpenStack Management Dashboard</h1>
-      <small class="opacity-75">NC-Cloud (cloud.uitiot.vn) - REST API thuần bằng Python Flask</small>
+    <div class="container-fluid px-4 d-flex justify-content-between align-items-center">
+      <div>
+        <h1 class="h4 mb-0">Nhóm 17 - NT533: OpenStack Management Dashboard</h1>
+        <small class="opacity-75">NC-Cloud (cloud.uitiot.vn) - REST API thuần bằng Python Flask</small>
+      </div>
+      <div class="d-flex align-items-center gap-2">
+        <span class="badge bg-success-subtle text-success border border-success-subtle px-2 py-1" id="autoSyncBadge" title="Tự động đồng bộ dữ liệu khi thao tác và định kỳ">
+          <span class="spinner-grow spinner-grow-sm me-1 text-success align-middle" style="width: 0.5rem; height: 0.5rem;" role="status"></span>
+          Tự động đồng bộ: BẬT
+        </span>
+      </div>
     </div>
   </header>
 
@@ -32,7 +40,7 @@
   <main class="container-fluid px-4 pb-5">
     <div id="spinnerBox" class="alert alert-info d-none d-flex align-items-center gap-3" role="status">
       <div class="spinner-border spinner-border-sm" aria-hidden="true"></div>
-      <span>Đang xử lý, vui lòng đợi 1-2 phút...</span>
+      <span>Hệ thống đang xử lý, vui lòng đợi ...</span>
     </div>
 
     <div class="row g-4">
@@ -43,7 +51,7 @@
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabNetwork" type="button">Network &amp; Subnet</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabRouter" type="button">Router</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabInstance" type="button">Instance</button></li>
-            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabSetup" type="button">1-Click &amp; Load Balancer</button></li>
+            <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabSetup" type="button">Thiết lập mạng &amp; Load Balancer</button></li>
             <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tabScale" type="button">Scale</button></li>
           </ul>
 
@@ -59,7 +67,10 @@
             </div>
 
             <div class="tab-pane fade" id="tabNetwork">
-              <h2 class="h6">Network</h2>
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <h2 class="h6 mb-0">Network</h2>
+                <button class="btn btn-sm btn-outline-secondary" id="btnReloadNetwork">Tải lại</button>
+              </div>
               <div class="input-group mb-2">
                 <input id="inNetName" class="form-control" placeholder="Tên network (vd: nhom17_net)">
                 <button class="btn btn-primary" id="btnCreateNet">Tạo network</button>
@@ -77,6 +88,10 @@
             </div>
 
             <div class="tab-pane fade" id="tabRouter">
+              <div class="d-flex justify-content-between align-items-center mb-2">
+                <h2 class="h6 mb-0">Router</h2>
+                <button class="btn btn-sm btn-outline-secondary" id="btnReloadRouter">Tải lại</button>
+              </div>
               <div class="input-group mb-2">
                 <input id="inRouterName" class="form-control" placeholder="Tên router (vd: nhom17_router)">
                 <div class="input-group-text"><input class="form-check-input mt-0 me-2" type="checkbox" id="chkExternal" checked> Nối External Network</div>
@@ -95,8 +110,14 @@
             <div class="tab-pane fade" id="tabInstance">
               <div class="row g-2 mb-2">
                 <div class="col-md-3"><input id="inVmName" class="form-control" placeholder="Tên VM (để trống = tự đặt)"></div>
-                <div class="col-md-4"><select id="selImage" class="form-select"></select></div>
-                <div class="col-md-5"><select id="selFlavor" class="form-select"></select></div>
+                <div class="col-md-3"><select id="selImage" class="form-select"></select></div>
+                <div class="col-md-3"><select id="selFlavor" class="form-select"></select></div>
+                <div class="col-md-3">
+                  <select id="selKeypair" class="form-select" title="Tùy chọn SSH Keypair">
+                    <option value="__AUTO__" selected>Tự tạo Key & tải .pem</option>
+                    <option value="__NONE__">Không dùng Keypair</option>
+                  </select>
+                </div>
               </div>
               <div class="d-flex gap-2 mb-3">
                 <button class="btn btn-primary" id="btnCreateVm">Tạo VM thường</button>
@@ -107,11 +128,27 @@
             </div>
 
             <div class="tab-pane fade" id="tabSetup">
-              <p class="text-muted">Tự động tạo <code>nhom17_net</code>, <code>nhom17_subnet</code>, <code>nhom17_router</code> và mở các port 80, 22, ICMP trên Security Group default. Chạy lại nhiều lần vẫn an toàn.</p>
-              <button class="btn btn-primary mb-4" id="btnSetup">Thiết lập mạng 1-Click</button>
-              <p class="text-muted">Tạo Load Balancer, Listener HTTP:80, Pool ROUND_ROBIN, thêm các VM nhom17_vm_* và gán Floating IP cho VIP.</p>
-              <button class="btn btn-success" id="btnCreateLb">Tạo Load Balancer</button>
-              <pre id="setupResult" class="mt-3 mb-0 small"></pre>
+              <h2 class="h6 mb-2">1. Thiết lập mạng tự động</h2>
+              <p class="text-muted small">Tự động tạo <code>nhom17_net</code>, <code>nhom17_subnet</code>, <code>nhom17_router</code> và mở các port 80, 22, ICMP trên Security Group default.</p>
+              <button class="btn btn-primary mb-4" id="btnSetup">Thiết lập mạng theo template yêu cầu 5</button>
+
+              <h2 class="h6 mb-2">2. Tạo Load Balancer</h2>
+              <p class="text-muted small">Tạo Load Balancer, Listener HTTP/TCP:80, Pool, tự động thêm các VM <code>nhom17_vm_*</code> vào Pool và cấp Floating IP cho VIP.</p>
+              <div class="row g-2 mb-2">
+                <div class="col-md-5">
+                  <input id="inLbName" class="form-control" placeholder="Tên Load Balancer (mặc định: nhom17_lb)">
+                </div>
+                <div class="col-md-3 d-grid">
+                  <button class="btn btn-success" id="btnCreateLb">Tạo Load Balancer</button>
+                </div>
+              </div>
+              <pre id="setupResult" class="mt-2 mb-3 small"></pre>
+
+              <div class="d-flex justify-content-between align-items-center mt-4 mb-2">
+                <h2 class="h6 mb-0">Danh sách Load Balancer</h2>
+                <button class="btn btn-sm btn-outline-secondary" id="btnReloadLb">Tải lại</button>
+              </div>
+              <div id="tblLoadBalancers" class="table-responsive"></div>
             </div>
 
             <div class="tab-pane fade" id="tabScale">
@@ -129,7 +166,7 @@
       <aside class="col-lg-4">
         <div class="card p-3 sticky-panel">
           <div class="d-flex justify-content-between align-items-center mb-2">
-            <h2 class="h6 mb-0">Nhật ký hệ thống (Activity Logs)</h2>
+            <h2 class="h6 mb-0">Nhật ký hệ thống (Activity Logs) <small class="text-muted fw-normal fs-6">- Thao tác trên Web App</small></h2>
             <button class="btn btn-sm btn-outline-secondary" id="btnClearLogs">Xóa</button>
           </div>
           <div id="logBox" class="log-box"></div>
@@ -137,6 +174,32 @@
       </aside>
     </div>
   </main>
+
+  <div class="modal fade" id="confirmModal" tabindex="-1" aria-labelledby="confirmModalLabel" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+      <div class="modal-content shadow border-0">
+        <div class="modal-header border-bottom-0 pb-0">
+          <h5 class="modal-title d-flex align-items-center gap-2" id="confirmModalLabel">
+            <span class="badge bg-danger-subtle text-danger p-2 rounded-circle">
+              <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" fill="currentColor" class="bi bi-exclamation-triangle" viewBox="0 0 16 16">
+                <path d="M7.938 2.016A.13.13 0 0 1 8.002 2a.13.13 0 0 1 .063.016.15.15 0 0 1 .054.057l6.857 11.667c.036.06.035.124.002.183a.2.2 0 0 1-.054.06.1.1 0 0 1-.066.017H1.146a.1.1 0 0 1-.066-.017.2.2 0 0 1-.054-.06.18.18 0 0 1 .002-.183L7.884 2.073a.15.15 0 0 1 .054-.057m1.044-.45a1.13 1.13 0 0 0-1.96 0L.165 13.233c-.457.778.091 1.767.98 1.767h13.713c.889 0 1.438-.99.98-1.767z"/>
+                <path d="M7.002 12a1 1 0 1 1 2 0 1 1 0 0 1-2 0M7.1 5.995a.905.905 0 1 1 1.8 0l-.35 3.507a.552.552 0 0 1-1.1 0z"/>
+              </svg>
+            </span>
+            <span id="confirmModalTitle">Xác nhận thao tác</span>
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Đóng"></button>
+        </div>
+        <div class="modal-body py-3">
+          <p id="confirmModalMessage" class="mb-0 text-secondary"></p>
+        </div>
+        <div class="modal-footer border-top-0 pt-0">
+          <button type="button" class="btn btn-sm btn-secondary px-3" data-bs-dismiss="modal">Hủy bỏ</button>
+          <button type="button" class="btn btn-sm btn-danger px-3" id="confirmModalOkBtn">Xác nhận xóa</button>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
   <script>
@@ -176,7 +239,6 @@
       box.scrollTop = box.scrollHeight;
     }
 
-    // Khóa nút, hiện spinner với tác vụ dài, hiển thị Toast và ghi Activity Logs khi có kết quả.
     async function run(btn, title, method, url, body, long = false) {
       btn.disabled = true;
       if (long) $("#spinnerBox").classList.remove("d-none");
@@ -245,90 +307,422 @@
       fillSelect("#selRouter", items, (r) => r.name, "Chọn router");
     }
 
+    function downloadPem(filename, content) {
+      const blob = new Blob([content], { type: "application/x-pem-file" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    async function loadKeypairs() {
+      const items = await loadList("/api/keypairs");
+      const sel = $("#selKeypair");
+      if (!sel) return;
+      const current = sel.value || "__AUTO__";
+      let html = '<option value="__AUTO__">Tự tạo Key & tải .pem</option>' +
+                 '<option value="__NONE__">Không dùng Keypair</option>';
+      if (items.length > 0) {
+        html += '<optgroup label="Keypair đã có trên Cloud">' +
+          items.map((k) => `<option value="${esc(k.name)}">${esc(k.name)}</option>`).join("") +
+          '</optgroup>';
+      }
+      sel.innerHTML = html;
+      sel.value = current;
+    }
+
     async function loadServers() {
       const items = await loadList("/api/servers");
       table("#tblServers", ["Tên", "Trạng thái", "IP nội bộ", "Floating IP", ""],
-        items.map((s) => [
-          esc(s.name), esc(s.status), esc(s.fixed_ips.join(", ")), esc(s.floating_ips.join(", ") || "-"),
-          `<button class="btn btn-sm btn-outline-primary me-1" data-act="fip" data-id="${esc(s.id)}">Gán Floating IP</button>` +
-          delBtn("del-server", s.id),
-        ]));
+        items.map((s) => {
+          const hasFip = s.floating_ips && s.floating_ips.length > 0;
+          const fipBtn = hasFip
+            ? `<button class="btn btn-sm btn-outline-warning me-1" data-act="unfip" data-id="${esc(s.id)}" title="Gỡ Floating IP khỏi máy ảo">Gỡ Floating IP</button>`
+            : `<button class="btn btn-sm btn-outline-primary me-1" data-act="fip" data-id="${esc(s.id)}">Gán Floating IP</button>`;
+
+          const powerBtn = s.status === "SHUTOFF"
+            ? `<button class="btn btn-sm btn-success me-1" data-act="start-server" data-id="${esc(s.id)}" title="Bật nguồn máy ảo">Bật</button>`
+            : (s.status === "ACTIVE"
+                ? `<button class="btn btn-sm btn-outline-secondary me-1" data-act="stop-server" data-id="${esc(s.id)}" title="Tắt nguồn máy ảo">Tắt</button>`
+                : "");
+
+          const statusBadge = s.status === "ACTIVE"
+            ? '<span class="badge bg-success">ACTIVE</span>'
+            : (s.status === "SHUTOFF"
+                ? '<span class="badge bg-secondary">SHUTOFF</span>'
+                : `<span class="badge bg-warning text-dark">${esc(s.status)}</span>`);
+
+          const fipDisplay = hasFip
+            ? s.floating_ips.map((ip) => `<a href="http://${esc(ip)}" target="_blank" class="fw-bold text-success text-decoration-none" title="Mở trong tab mới (http://${esc(ip)})">${esc(ip)} </a>`).join(", ")
+            : '<span class="text-muted">-</span>';
+
+          return [
+            esc(s.name), statusBadge, esc(s.fixed_ips.join(", ")), fipDisplay,
+            powerBtn + fipBtn + delBtn("del-server", s.id),
+          ];
+        }));
       const vms = items.filter((s) => /^nhom17_vm_\d+$/.test(s.name));
       fillSelect("#selScaleIn", vms, (s) => s.name, "Tự chọn VM cuối (nhom17_vm_N lớn nhất)");
     }
 
-    const refreshNetworkTabs = () => Promise.all([loadNetworks(), loadSubnets()]);
+    async function loadLoadBalancers() {
+      const items = await loadList("/api/loadbalancers");
+      table("#tblLoadBalancers", ["Tên", "Trạng thái", "VIP nội bộ", "Floating IP (Truy cập Web)", "Provider", "Cấu hình", ""],
+        items.map((lb) => {
+          const provBadge = lb.provisioning_status === "ACTIVE"
+            ? '<span class="badge bg-success">ACTIVE</span>'
+            : (lb.provisioning_status === "ERROR"
+                ? '<span class="badge bg-danger">ERROR</span>'
+                : `<span class="badge bg-warning text-dark">${esc(lb.provisioning_status)}</span>`);
+
+          const operBadge = lb.operating_status === "ONLINE"
+            ? '<span class="badge bg-info text-dark">ONLINE</span>'
+            : `<span class="badge bg-secondary">${esc(lb.operating_status)}</span>`;
+
+          const fipDisplay = lb.floating_ip
+            ? `<a href="http://${esc(lb.floating_ip)}" target="_blank" class="fw-bold text-success text-decoration-none" title="Mở trang web Load Balancer (http://${esc(lb.floating_ip)})">🔗 ${esc(lb.floating_ip)}</a>`
+            : '<span class="text-muted">-</span>';
+
+          const poolsCount = lb.pools ? lb.pools.length : 0;
+          const listenersCount = lb.listeners ? lb.listeners.length : 0;
+          const configInfo = `<small class="text-muted">${listenersCount} listener, ${poolsCount} pool</small>`;
+
+          return [
+            `<strong>${esc(lb.name)}</strong><br><small class="text-muted font-monospace">${esc(lb.id.substring(0, 8))}...</small>`,
+            `${provBadge} ${operBadge}`,
+            esc(lb.vip_address || "-"),
+            fipDisplay,
+            `<span class="badge bg-light text-dark border">${esc(lb.provider || "ovn")}</span>`,
+            configInfo,
+            delBtn("del-lb", lb.id),
+          ];
+        }));
+    }
+
+    function confirmDialog(title, message, okText = "Xác nhận xóa") {
+      return new Promise((resolve) => {
+        const modalEl = $("#confirmModal");
+        $("#confirmModalTitle").textContent = title;
+        $("#confirmModalMessage").textContent = message;
+        const okBtn = $("#confirmModalOkBtn");
+        okBtn.textContent = okText;
+
+        const modal = bootstrap.Modal.getOrCreateInstance(modalEl);
+        let confirmed = false;
+
+        const onOk = () => {
+          confirmed = true;
+          modal.hide();
+        };
+
+        const onHidden = () => {
+          okBtn.removeEventListener("click", onOk);
+          modalEl.removeEventListener("hidden.bs.modal", onHidden);
+          resolve(confirmed);
+        };
+
+        okBtn.addEventListener("click", onOk);
+        modalEl.addEventListener("hidden.bs.modal", onHidden);
+        modal.show();
+      });
+    }
+
+    async function refreshNetworksAndSubnets() {
+      await loadNetworks();
+      await loadSubnets();
+      await loadRouters();
+    }
 
     document.addEventListener("click", async (event) => {
       const btn = event.target.closest("[data-act]");
       if (!btn) return;
       const id = btn.dataset.id;
-      if (btn.dataset.act === "del-net" && confirm("Xóa network này cùng các subnet con?")) {
-        await run(btn, "Xóa network", "DELETE", `/api/networks/${id}`); await refreshNetworkTabs();
-      } else if (btn.dataset.act === "del-subnet" && confirm("Xóa subnet này?")) {
-        await run(btn, "Xóa subnet", "DELETE", `/api/subnets/${id}`); await loadSubnets();
-      } else if (btn.dataset.act === "del-router" && confirm("Gỡ interface và xóa router này?")) {
-        await run(btn, "Xóa router", "DELETE", `/api/routers/${id}`); await loadRouters();
-      } else if (btn.dataset.act === "del-server" && confirm("Xóa máy ảo này?")) {
-        await run(btn, "Xóa máy ảo", "DELETE", `/api/servers/${id}`); await loadServers();
+      if (btn.dataset.act === "del-net") {
+        const ok = await confirmDialog(
+          "Xác nhận xóa Network",
+          "Bạn có chắc chắn muốn xóa Network này? Tất cả các Subnet con bên trong cũng sẽ bị xóa vĩnh viễn và không thể khôi phục."
+        );
+        if (ok) {
+          const res = await run(btn, "Xóa network", "DELETE", `/api/networks/${id}`);
+          if (res.success) await refreshNetworksAndSubnets();
+        }
+      } else if (btn.dataset.act === "del-subnet") {
+        const ok = await confirmDialog(
+          "Xác nhận xóa Subnet",
+          "Bạn có chắc chắn muốn xóa Subnet này khỏi hệ thống OpenStack không?"
+        );
+        if (ok) {
+          const res = await run(btn, "Xóa subnet", "DELETE", `/api/subnets/${id}`);
+          if (res.success) await refreshNetworksAndSubnets();
+        }
+      } else if (btn.dataset.act === "del-router") {
+        const ok = await confirmDialog(
+          "Xác nhận xóa Router",
+          "Bạn có chắc chắn muốn xóa Router này? Hệ thống sẽ tự động gỡ toàn bộ interface subnet liên kết trước khi xóa."
+        );
+        if (ok) {
+          const res = await run(btn, "Xóa router", "DELETE", `/api/routers/${id}`);
+          if (res.success) await loadRouters();
+        }
+      } else if (btn.dataset.act === "del-server") {
+        const ok = await confirmDialog(
+          "Xác nhận xóa Máy ảo (VM)",
+          "Bạn có chắc chắn muốn xóa máy ảo này? Mọi dữ liệu trên máy ảo sẽ bị xóa hoàn toàn khỏi OpenStack."
+        );
+        if (ok) {
+          const res = await run(btn, "Xóa máy ảo", "DELETE", `/api/servers/${id}`);
+          if (res.success) await loadServers();
+        }
+      } else if (btn.dataset.act === "del-lb") {
+        const ok = await confirmDialog(
+          "Xác nhận xóa Load Balancer",
+          "Bạn có chắc chắn muốn xóa Load Balancer này? Hệ thống sẽ tự động gỡ Floating IP và xóa toàn bộ Listener, Pool, Member liên kết (cascade delete)."
+        );
+        if (ok) {
+          const res = await run(btn, "Xóa Load Balancer", "DELETE", `/api/loadbalancers/${id}`, null, true);
+          if (res.success) await loadLoadBalancers();
+        }
       } else if (btn.dataset.act === "fip") {
-        await run(btn, "Gán Floating IP", "POST", `/api/servers/${id}/floating-ip`); await loadServers();
+        const res = await run(btn, "Gán Floating IP", "POST", `/api/servers/${id}/floating-ip`);
+        if (res.success) await loadServers();
+      } else if (btn.dataset.act === "unfip") {
+        const ok = await confirmDialog(
+          "Gỡ Floating IP",
+          "Bạn có chắc chắn muốn gỡ Floating IP ra khỏi máy ảo này không?",
+          "Xác nhận gỡ IP"
+        );
+        if (ok) {
+          const res = await run(btn, "Gỡ Floating IP", "DELETE", `/api/servers/${id}/floating-ip`);
+          if (res.success) await loadServers();
+        }
+      } else if (btn.dataset.act === "start-server") {
+        const res = await run(btn, "Bật máy ảo", "POST", `/api/servers/${id}/start`);
+        if (res.success) await loadServers();
+      } else if (btn.dataset.act === "stop-server") {
+        const ok = await confirmDialog(
+          "Tắt Máy ảo (VM)",
+          "Bạn có chắc chắn muốn tắt nguồn máy ảo này không?",
+          "Xác nhận tắt nguồn"
+        );
+        if (ok) {
+          const res = await run(btn, "Tắt máy ảo", "POST", `/api/servers/${id}/stop`);
+          if (res.success) await loadServers();
+        }
       }
     });
 
-    $("#btnReloadCatalog").onclick = () => Promise.all([loadFlavors(), loadImages()]);
+    $("#btnReloadCatalog").onclick = async () => {
+      await loadFlavors();
+      await loadImages();
+    };
+    if ($("#btnReloadNetwork")) $("#btnReloadNetwork").onclick = refreshNetworksAndSubnets;
+    if ($("#btnReloadRouter")) $("#btnReloadRouter").onclick = loadRouters;
     $("#btnReloadServers").onclick = loadServers;
+    if ($("#btnReloadLb")) $("#btnReloadLb").onclick = loadLoadBalancers;
     $("#btnClearLogs").onclick = () => { $("#logBox").textContent = ""; };
 
     $("#btnCreateNet").onclick = async (e) => {
-      await run(e.target, "Tạo network", "POST", "/api/networks", { name: $("#inNetName").value.trim() });
-      await refreshNetworkTabs();
+      const input = $("#inNetName");
+      const name = input.value.trim();
+      const res = await run(e.target, "Tạo network", "POST", "/api/networks", { name });
+      if (res.success) {
+        input.value = "";
+        await refreshNetworksAndSubnets();
+      }
     };
-    $("#btnCreateSubnet").onclick = async (e) => {
-      await run(e.target, "Tạo subnet", "POST", "/api/subnets", {
-        name: $("#inSubName").value.trim(), network_id: $("#selSubNet").value,
-        cidr: $("#inSubCidr").value.trim(), gateway_ip: $("#inSubGw").value.trim(),
-      });
-      await loadSubnets();
-    };
-    $("#btnCreateRouter").onclick = async (e) => {
-      await run(e.target, "Tạo router", "POST", "/api/routers",
-        { name: $("#inRouterName").value.trim(), external: $("#chkExternal").checked });
-      await loadRouters();
-    };
-    $("#btnAttach").onclick = (e) => run(e.target, "Gắn interface", "POST",
-      `/api/routers/${$("#selRouter").value}/interfaces`, { subnet_id: $("#selIfaceSubnet").value });
-    $("#btnDetach").onclick = (e) => run(e.target, "Gỡ interface", "DELETE",
-      `/api/routers/${$("#selRouter").value}/interfaces`, { subnet_id: $("#selIfaceSubnet").value });
 
-    const vmPayload = () => ({
-      name: $("#inVmName").value.trim(), image_id: $("#selImage").value, flavor_id: $("#selFlavor").value,
-    });
-    $("#btnCreateVm").onclick = async (e) => {
-      await run(e.target, "Tạo VM thường", "POST", "/api/servers", vmPayload(), true); await loadServers();
+    $("#btnCreateSubnet").onclick = async (e) => {
+      const nameInput = $("#inSubName");
+      const cidrInput = $("#inSubCidr");
+      const gwInput = $("#inSubGw");
+      const res = await run(e.target, "Tạo subnet", "POST", "/api/subnets", {
+        name: nameInput.value.trim(),
+        network_id: $("#selSubNet").value,
+        cidr: cidrInput.value.trim(),
+        gateway_ip: gwInput.value.trim(),
+      });
+      if (res.success) {
+        nameInput.value = "";
+        cidrInput.value = "";
+        gwInput.value = "";
+        await refreshNetworksAndSubnets();
+      }
     };
-    $("#btnCreateWebVm").onclick = async (e) => {
-      await run(e.target, "Tạo VM Web Server", "POST", "/api/servers/web", vmPayload(), true); await loadServers();
+
+    $("#btnCreateRouter").onclick = async (e) => {
+      const nameInput = $("#inRouterName");
+      const res = await run(e.target, "Tạo router", "POST", "/api/routers", {
+        name: nameInput.value.trim(),
+        external: $("#chkExternal").checked,
+      });
+      if (res.success) {
+        nameInput.value = "";
+        await loadRouters();
+      }
     };
+
+    $("#btnAttach").onclick = async (e) => {
+      const res = await run(e.target, "Gắn interface", "POST",
+        `/api/routers/${$("#selRouter").value}/interfaces`, { subnet_id: $("#selIfaceSubnet").value });
+      if (res.success) await loadRouters();
+    };
+
+    $("#btnDetach").onclick = async (e) => {
+      const routerId = $("#selRouter").value;
+      const subnetId = $("#selIfaceSubnet").value;
+      if (!routerId || !subnetId) {
+        toast(false, "Vui lòng chọn Router và Subnet cần gỡ interface");
+        return;
+      }
+      const ok = await confirmDialog(
+        "Gỡ Interface Subnet",
+        "Bạn có chắc chắn muốn gỡ Subnet này ra khỏi Router không?",
+        "Xác nhận gỡ"
+      );
+      if (ok) {
+        const res = await run(e.target, "Gỡ interface", "DELETE",
+          `/api/routers/${routerId}/interfaces`, { subnet_id: subnetId });
+        if (res.success) await loadRouters();
+      }
+    };
+
+    const vmPayload = () => {
+      const keyChoice = $("#selKeypair") ? $("#selKeypair").value : "__AUTO__";
+      let key_mode = "auto";
+      let key_name = null;
+      if (keyChoice === "__NONE__") {
+        key_mode = "none";
+      } else if (keyChoice !== "__AUTO__") {
+        key_mode = "existing";
+        key_name = keyChoice;
+      }
+      return {
+        name: $("#inVmName").value.trim(),
+        image_id: $("#selImage").value,
+        flavor_id: $("#selFlavor").value,
+        key_mode,
+        key_name,
+      };
+    };
+
+    async function handleVmCreation(btn, title, url) {
+      const res = await run(btn, title, "POST", url, vmPayload(), true);
+      if (res.success) {
+        $("#inVmName").value = "";
+        if (res.data?.keypair?.private_key) {
+          const kp = res.data.keypair;
+          downloadPem(`${kp.name}.pem`, kp.private_key);
+          toast(true, `Đã tự động tải về khóa SSH: ${kp.name}.pem`);
+        }
+        await Promise.all([loadServers(), loadKeypairs()]);
+      }
+    }
+
+    $("#btnCreateVm").onclick = (e) => handleVmCreation(e.target, "Tạo VM thường", "/api/servers");
+    $("#btnCreateWebVm").onclick = (e) => handleVmCreation(e.target, "Tạo VM Web Server", "/api/servers/web");
 
     $("#btnSetup").onclick = async (e) => {
-      const res = await run(e.target, "Thiết lập mạng 1-Click", "POST", "/api/setup", null, true);
+      const res = await run(e.target, "Thiết lập mạng theo template yêu cầu 5", "POST", "/api/setup", null, true);
       $("#setupResult").textContent = JSON.stringify(res.data, null, 2);
-      await Promise.all([refreshNetworkTabs(), loadRouters()]);
-    };
-    $("#btnCreateLb").onclick = async (e) => {
-      const res = await run(e.target, "Tạo Load Balancer", "POST", "/api/loadbalancer", null, true);
-      $("#setupResult").textContent = JSON.stringify(res.data, null, 2);
-    };
-    $("#btnScaleOut").onclick = async (e) => {
-      await run(e.target, "Scale Out", "POST", "/api/scale-out", null, true); await loadServers();
-    };
-    $("#btnScaleIn").onclick = async (e) => {
-      await run(e.target, "Scale In", "POST", "/api/scale-in", { server_id: $("#selScaleIn").value }, true);
-      await loadServers();
+      if (res.success) {
+        await refreshNetworksAndSubnets();
+        await loadServers();
+      }
     };
 
-    Promise.all([loadFlavors(), loadImages(), refreshNetworkTabs(), loadRouters(), loadServers()]);
+    $("#btnCreateLb").onclick = async (e) => {
+      const nameInput = $("#inLbName");
+      const name = nameInput ? nameInput.value.trim() : "";
+      const res = await run(e.target, "Tạo Load Balancer", "POST", "/api/loadbalancer", name ? { name } : null, true);
+      $("#setupResult").textContent = JSON.stringify(res.data, null, 2);
+      if (res.success) {
+        if (nameInput) nameInput.value = "";
+        await Promise.all([loadServers(), loadLoadBalancers()]);
+      }
+    };
+
+    $("#btnScaleOut").onclick = async (e) => {
+      const res = await run(e.target, "Scale Out", "POST", "/api/scale-out", null, true);
+      if (res.success) await loadServers();
+    };
+
+    $("#btnScaleIn").onclick = async (e) => {
+      const serverId = $("#selScaleIn").value;
+      const ok = await confirmDialog(
+        "Xác nhận Scale In (-1 VM)",
+        serverId
+          ? "Hệ thống sẽ gỡ máy ảo đã chọn khỏi Load Balancer Pool và tiến hành xóa máy ảo. Bạn có chắc chắn muốn tiếp tục?"
+          : "Hệ thống sẽ tự động chọn máy ảo cuối (nhom17_vm_N lớn nhất), gỡ khỏi Load Balancer và xóa. Bạn có chắc chắn muốn tiếp tục?",
+        "Xác nhận Scale In"
+      );
+      if (ok) {
+        const res = await run(e.target, "Scale In", "POST", "/api/scale-in", { server_id: serverId }, true);
+        if (res.success) await loadServers();
+      }
+    };
+
+    document.querySelectorAll('button[data-bs-toggle="tab"]').forEach((tabBtn) => {
+      tabBtn.addEventListener("shown.bs.tab", async (event) => {
+        const targetId = event.target.getAttribute("data-bs-target");
+        if (targetId === "#tabCatalog") {
+          await loadFlavors();
+          await loadImages();
+        } else if (targetId === "#tabNetwork") {
+          await loadNetworks();
+          await loadSubnets();
+        } else if (targetId === "#tabRouter") {
+          await loadRouters();
+          await loadSubnets();
+        } else if (targetId === "#tabInstance" || targetId === "#tabScale") {
+          await loadServers();
+          if (targetId === "#tabInstance") await loadKeypairs();
+        } else if (targetId === "#tabSetup") {
+          await loadLoadBalancers();
+        }
+      });
+    });
+
+    let isPolling = false;
+    async function autoPoll() {
+      if (isPolling || document.hidden) return;
+      isPolling = true;
+      try {
+        const activePane = $(".tab-pane.active");
+        if (!activePane) return;
+        const id = activePane.id;
+        if (id === "tabNetwork") {
+          await loadNetworks();
+          await loadSubnets();
+        } else if (id === "tabRouter") {
+          await loadRouters();
+        } else if (id === "tabInstance" || id === "tabScale") {
+          await loadServers();
+        } else if (id === "tabSetup") {
+          await loadLoadBalancers();
+        }
+      } catch (err) {
+        console.warn("Auto-sync error:", err);
+      } finally {
+        isPolling = false;
+      }
+    }
+    setInterval(autoPoll, 10000);
+
+    async function initDashboard() {
+      await loadFlavors();
+      await loadImages();
+      await loadKeypairs();
+      await loadNetworks();
+      await loadSubnets();
+      await loadRouters();
+      await loadServers();
+      await loadLoadBalancers();
+    }
+    initDashboard();
   </script>
 </body>
 </html>

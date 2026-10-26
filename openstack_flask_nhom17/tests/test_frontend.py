@@ -7,6 +7,7 @@ REQUIRED_IDS = [
     "btnSetup", "btnCreateLb", "btnScaleOut", "btnScaleIn", "selScaleIn",
     "tblFlavors", "tblImages", "tblNetworks", "tblSubnets", "tblRouters", "tblServers",
     "btnCreateVm", "btnCreateWebVm", "btnCreateNet", "btnCreateSubnet", "btnCreateRouter",
+    "tblLoadBalancers", "inLbName", "btnReloadLb",
 ]
 
 
@@ -27,4 +28,4 @@ def test_page_has_title_and_single_h1(page):
     assert "<title>Nhóm 17 - NT533" in page
     assert page.count("<h1") == 1
     assert "Nhật ký hệ thống (Activity Logs)" in page
-    assert "Đang xử lý, vui lòng đợi 1-2 phút..." in page
+    assert "vui lòng đợi" in page
